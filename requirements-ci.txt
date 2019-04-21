@@ -1,2 +1,6 @@
+<<<<<<< HEAD
 -e git+https://github.com/lablup/backend.ai-common#egg=backend.ai-common
+=======
+-e git+https://github.com/lablup/backend.ai-common@{BRANCH}#egg=backend.ai-common
+>>>>>>> c2bb79a19c0574845ab66cc5f3c3402c9833ea34
 -e .[build,test,ci]

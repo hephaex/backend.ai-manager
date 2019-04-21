@@ -1,15 +1,31 @@
+from argparse import Namespace
 import asyncio
-import contextlib
-import gc
-import pathlib
-import socket
-import ssl
+from datetime import datetime
+import hashlib, hmac
+from importlib import import_module
+import json
+import multiprocessing as mp
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import tempfile
 
+import aiodocker
 import aiohttp
 from aiohttp import web
-import asyncpgsa
+import aiohttp_cors
+import aiojobs.aiohttp
+from aiopg.sa import create_engine
+from async_timeout import timeout
+from dateutil.tz import tzutc
 import sqlalchemy as sa
+import psycopg2 as pg
 import pytest
+<<<<<<< HEAD
 import uvloop
 
 from backend.ai.gateway.config import load_config
@@ -29,45 +45,150 @@ def loop_context(loop=None):
         current_scope = True
 
     yield loop
+=======
+>>>>>>> c2bb79a19c0574845ab66cc5f3c3402c9833ea34
 
-    if current_scope:
-        if not loop.is_closed():
-            loop.call_soon(loop.stop)
-            loop.run_forever()
-            loop.close()
-        gc.collect()
-        asyncio.set_event_loop(None)
+from ai.backend.common.argparse import host_port_pair
+from ai.backend.gateway.config import load_config
+from ai.backend.gateway.events import event_router
+from ai.backend.gateway.server import (
+    gw_init, gw_shutdown, gw_args,
+    exception_middleware, api_middleware,
+    _get_legacy_handler,
+    PUBLIC_INTERFACES)
+from ai.backend.manager.models.base import populate_fixture
+from ai.backend.manager.models import agents, kernels, keypairs, vfolders
+from ai.backend.manager.cli.etcd import delete, put
+from ai.backend.manager.cli.dbschema import oneshot
 
-
-def pytest_pycollect_makeitem(collector, name, obj):
-    # Patch pytest for coroutines
-    if collector.funcnamefilter(name) and asyncio.iscoroutinefunction(obj):
-        return list(collector._genfunctions(name, obj))
-
-
-def pytest_pyfunc_call(pyfuncitem):
-    # Patch pytest for coroutines.
-    if asyncio.iscoroutinefunction(pyfuncitem.function):
-        existing_loop = pyfuncitem.funcargs.get('loop', None)
-        with loop_context(existing_loop) as loop:
-            testargs = {arg: pyfuncitem.funcargs[arg]
-                        for arg in pyfuncitem._fixtureinfo.argnames}
-            task = loop.create_task(pyfuncitem.obj(**testargs))
-            loop.run_until_complete(task)
-        return True
+here = Path(__file__).parent
 
 
-@pytest.fixture
-def unused_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+@pytest.fixture(scope='session')
+def test_id():
+    return secrets.token_hex(12)
 
 
-@pytest.yield_fixture
-def loop():
-    with loop_context() as loop:
-        yield loop
+@pytest.fixture(scope='session')
+def test_ns(test_id):
+    return f'testing-ns-{test_id}'
+
+
+@pytest.fixture(scope='session')
+def test_db(test_id):
+    return f'test_db_{test_id}'
+
+
+@pytest.fixture(scope='session')
+def folder_mount(test_id):
+    return Path(f'/tmp/backend.ai/vfolders-{test_id}')
+
+
+@pytest.fixture(scope='session')
+def folder_fsprefix(test_id):
+    # NOTE: the prefix must NOT start with "/"
+    return Path('fsprefix/inner/')
+
+
+@pytest.fixture(scope='session')
+def folder_host():
+    return 'local'
+
+
+@pytest.fixture(scope='session', autouse=True)
+def prepare_and_cleanup_databases(request, test_ns, test_db,
+                                  folder_mount, folder_host, folder_fsprefix):
+    os.environ['BACKEND_NAMESPACE'] = test_ns
+    os.environ['BACKEND_DB_NAME'] = test_db
+
+    # Clear and reset etcd namespace using CLI functions.
+    etcd_addr = host_port_pair(os.environ['BACKEND_ETCD_ADDR'])
+    etcd_user = os.environ.get('BACKEND_ETCD_USER')
+    etcd_password = os.environ.get('BACKEND_ETCD_PASSWORD')
+    args = Namespace(key='volumes/_mount', value=str(folder_mount),
+                     etcd_user=etcd_user, etcd_password=etcd_password,
+                     etcd_addr=etcd_addr, namespace=test_ns)
+    put(args)
+    args = Namespace(key='volumes/_fsprefix', value=str(folder_fsprefix),
+                     etcd_user=etcd_user, etcd_password=etcd_password,
+                     etcd_addr=etcd_addr, namespace=test_ns)
+    put(args)
+    args = Namespace(key='volumes/_default_host', value=str(folder_host),
+                     etcd_user=etcd_user, etcd_password=etcd_password,
+                     etcd_addr=etcd_addr, namespace=test_ns)
+    put(args)
+    args = Namespace(key='config/docker/registry/index.docker.io',
+                     value='https://registry-1.docker.io',
+                     etcd_user=etcd_user, etcd_password=etcd_password,
+                     etcd_addr=etcd_addr, namespace=test_ns)
+    put(args)
+
+    def finalize_etcd():
+        args = Namespace(key='', prefix=True,
+                         etcd_user=etcd_user, etcd_password=etcd_password,
+                         etcd_addr=etcd_addr, namespace=test_ns)
+        delete(args)
+
+    request.addfinalizer(finalize_etcd)
+
+    # Create database using low-level psycopg2 API.
+    db_addr = host_port_pair(os.environ['BACKEND_DB_ADDR'])
+    db_user = os.environ['BACKEND_DB_USER']
+    db_pass = os.environ['BACKEND_DB_PASSWORD']
+    if db_pass:
+        # TODO: escape/urlquote db_pass
+        db_url = f'postgresql://{db_user}:{db_pass}@{db_addr}'
+    else:
+        db_url = f'postgresql://{db_user}@{db_addr}'
+    conn = pg.connect(db_url)
+    conn.set_isolation_level(pg.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+    cur.execute(f'CREATE DATABASE "{test_db}";')
+    cur.close()
+    conn.close()
+
+    def finalize_db():
+        conn = pg.connect(db_url)
+        conn.set_isolation_level(pg.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        cur = conn.cursor()
+        cur.execute(f'REVOKE CONNECT ON DATABASE "{test_db}" FROM public;')
+        cur.execute('SELECT pg_terminate_backend(pid) FROM pg_stat_activity '
+                    'WHERE pid <> pg_backend_pid();')
+        cur.execute(f'DROP DATABASE "{test_db}";')
+        cur.close()
+        conn.close()
+
+    request.addfinalizer(finalize_db)
+
+    # Load the database schema using CLI function.
+    alembic_url = db_url + '/' + test_db
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf8') as alembic_cfg:
+        alembic_sample_cfg = here / '..' / 'alembic.ini.sample'
+        alembic_cfg_data = alembic_sample_cfg.read_text()
+        alembic_cfg_data = re.sub(
+            r'^sqlalchemy.url = .*$',
+            f'sqlalchemy.url = {alembic_url}',
+            alembic_cfg_data, flags=re.M)
+        alembic_cfg.write(alembic_cfg_data)
+        alembic_cfg.flush()
+        args = Namespace(
+            config=Path(alembic_cfg.name),
+            schema_version='head')
+        oneshot(args)
+
+    # Populate example_keypair fixture
+    fixtures = {}
+    fixtures.update(json.loads(
+        (Path(__file__).parent.parent /
+         'sample-configs' / 'example-keypairs.json').read_text()))
+    fixtures.update(json.loads(
+        (Path(__file__).parent.parent /
+         'sample-configs' / 'example-resource-presets.json').read_text()))
+    engine = sa.create_engine(alembic_url)
+    conn = engine.connect()
+    populate_fixture(conn, fixtures)
+    conn.close()
+    engine.dispose()
 
 
 class Client:
@@ -77,8 +198,8 @@ class Client:
             url += '/'
         self._url = url
 
-    def close(self):
-        self._session.close()
+    async def close(self):
+        await self._session.close()
 
     def request(self, method, path, **kwargs):
         while path.startswith('/'):
@@ -98,11 +219,23 @@ class Client:
         url = self._url + path
         return self._session.post(url, **kwargs)
 
+    def put(self, path, **kwargs):
+        while path.startswith('/'):
+            path = path[1:]
+        url = self._url + path
+        return self._session.put(url, **kwargs)
+
+    def patch(self, path, **kwargs):
+        while path.startswith('/'):
+            path = path[1:]
+        url = self._url + path
+        return self._session.patch(url, **kwargs)
+
     def delete(self, path, **kwargs):
         while path.startswith('/'):
             path = path[1:]
         url = self._url + path
-        return self._session.delete(url)
+        return self._session.delete(url, **kwargs)
 
     def ws_connect(self, path, **kwargs):
         while path.startswith('/'):
@@ -112,85 +245,337 @@ class Client:
 
 
 @pytest.fixture
-def default_keypair(loop):
+async def app(event_loop, test_ns, test_db, unused_tcp_port):
+    """ For tests that do not require actual server running.
+    """
+    app = web.Application(middlewares=[
+        exception_middleware,
+        api_middleware,
+    ])
+    app['config'] = load_config(argv=[], extra_args_funcs=(gw_args,))
+    app['config'].debug = True
 
-    async def _fetch():
-        access_key = 'AKIAIOSFODNN7EXAMPLE'
-        config = load_config(argv=[], extra_args_func=gw_args)
-        pool = await asyncpgsa.create_pool(
-            host=str(config.db_addr[0]),
-            port=config.db_addr[1],
-            database=config.db_name,
-            user=config.db_user,
-            password=config.db_password,
-            min_size=1, max_size=2,
-        )
-        async with pool.acquire() as conn:
-            query = sa.select([KeyPair.c.access_key, KeyPair.c.secret_key]) \
-                      .where(KeyPair.c.access_key == access_key)
-            row = await conn.fetchrow(query)
-            keypair = {
-                'access_key': access_key,
-                'secret_key': row.secret_key,
-            }
-        await pool.close()
-        return keypair
+    app['config'].etcd_addr = host_port_pair(os.environ['BACKEND_ETCD_ADDR'])
+    app['config'].etcd_user = os.environ.get('BACKEND_ETCD_USER')
+    app['config'].etcd_password = os.environ.get('BACKEND_ETCD_PASSWORD')
 
-    return loop.run_until_complete(_fetch())
+    app['config'].redis_addr = host_port_pair(os.environ['BACKEND_REDIS_ADDR'])
+    app['config'].redis_password = os.environ.get('BACKEND_REDIS_PASSWORD')
 
-async def _create_server(loop, unused_port, extra_inits=None, debug=False):
-    app = web.Application(loop=loop)
-    app.config = load_config(argv=[], extra_args_func=gw_args)
+    # Override basic settings.
+    # Change these configs if local servers have different port numbers.
+    app['config'].db_addr = host_port_pair(os.environ['BACKEND_DB_ADDR'])
+    app['config'].db_name = test_db
+    app['config'].docker_registry = 'lablup'
 
-    # Override default configs for testing setup.
-    app.config.ssl_cert = here / 'sample-ssl-cert' / 'sample.crt'
-    app.config.ssl_key = here / 'sample-ssl-cert' / 'sample.key'
-    app.config.service_ip = '127.0.0.1'
-    app.config.service_port = unused_port
-    app.sslctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-    app.sslctx.load_cert_chain(str(app.config.ssl_cert),
-                               str(app.config.ssl_key))
+    # Override extra settings
+    app['config'].namespace = test_ns
+    app['config'].heartbeat_timeout = 10.0
+    app['config'].service_ip = '127.0.0.1'
+    app['config'].service_port = unused_tcp_port
+    app['config'].verbose = False
+    # import ssl
+    # app['config'].ssl_cert = here / 'sample-ssl-cert' / 'sample.crt'
+    # app['config'].ssl_key = here / 'sample-ssl-cert' / 'sample.key'
+    # app['sslctx'] = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    # app['sslctx'].load_cert_chain(str(app['config'].ssl_cert),
+    #                            str(app['config'].ssl_key))
 
-    await gw_init(app)
-    if extra_inits:
-        for init in extra_inits:
-            await init(app)
-    handler = app.make_handler(debug=debug, keep_alive_on=False)
-    server = await loop.create_server(handler,
-                                      app.config.service_ip,
-                                      app.config.service_port,
-                                      ssl=app.sslctx)
-    return app, app.config.service_port, handler, server
-
-async def _finish_server(app, handler, server):
-    server.close()
-    await server.wait_closed()
-    await app.shutdown()
-    await handler.finish_connections()
-    await app.cleanup()
+    # num_workers = 1
+    app['pidx'] = 0
+    return app
 
 
-@pytest.yield_fixture
-def create_app_and_client(loop, unused_port):
+@pytest.fixture
+async def default_keypair(event_loop, app):
+    access_key = 'AKIAIOSFODNN7EXAMPLE'
+    config = app['config']
+    pool = await create_engine(
+        host=config.db_addr[0], port=config.db_addr[1],
+        user=config.db_user, password=config.db_password,
+        dbname=config.db_name, minsize=1, maxsize=4
+    )
+    async with pool.acquire() as conn:
+        query = (sa.select([keypairs.c.access_key, keypairs.c.secret_key])
+                   .select_from(keypairs)
+                   .where(keypairs.c.access_key == access_key))
+        result = await conn.execute(query)
+        row = await result.first()
+        keypair = {
+            'access_key': access_key,
+            'secret_key': row.secret_key,
+        }
+    pool.close()
+    await pool.wait_closed()
+    return keypair
+
+
+@pytest.fixture
+async def user_keypair(event_loop, app):
+    access_key = 'AKIANABBDUSEREXAMPLE'
+    config = app['config']
+    pool = await create_engine(
+        host=config.db_addr[0], port=config.db_addr[1],
+        user=config.db_user, password=config.db_password,
+        dbname=config.db_name, minsize=1, maxsize=4
+    )
+    async with pool.acquire() as conn:
+        query = (sa.select([keypairs.c.access_key, keypairs.c.secret_key])
+                   .select_from(keypairs)
+                   .where(keypairs.c.access_key == access_key))
+        result = await conn.execute(query)
+        row = await result.first()
+        keypair = {
+            'access_key': access_key,
+            'secret_key': row.secret_key,
+        }
+    pool.close()
+    await pool.wait_closed()
+    return keypair
+
+
+@pytest.fixture
+def get_headers(app, default_keypair, prepare_docker_images):
+    def create_header(method, url, req_bytes, ctype='application/json',
+                      hash_type='sha256', api_version='v4.20181215',
+                      keypair=default_keypair):
+        now = datetime.now(tzutc())
+        hostname = f"localhost:{app['config'].service_port}"
+        headers = {
+            'Date': now.isoformat(),
+            'Content-Type': ctype,
+            'Content-Length': str(len(req_bytes)),
+            'X-BackendAI-Version': api_version,
+        }
+        if api_version >= 'v4.20181215':
+            req_bytes = b''
+        else:
+            if ctype.startswith('multipart'):
+                req_bytes = b''
+        if ctype.startswith('multipart'):
+            # Let aiohttp to create appropriate header values
+            # (e.g., multipart content-type header with message boundaries)
+            del headers['Content-Type']
+            del headers['Content-Length']
+        req_hash = hashlib.new(hash_type, req_bytes).hexdigest()
+        sign_bytes = method.upper().encode() + b'\n' \
+                     + url.encode() + b'\n' \
+                     + now.isoformat().encode() + b'\n' \
+                     + b'host:' + hostname.encode() + b'\n' \
+                     + b'content-type:' + ctype.encode() + b'\n' \
+                     + b'x-backendai-version:' + api_version.encode() + b'\n' \
+                     + req_hash.encode()
+        sign_key = hmac.new(keypair['secret_key'].encode(),
+                            now.strftime('%Y%m%d').encode(), hash_type).digest()
+        sign_key = hmac.new(sign_key, hostname.encode(), hash_type).digest()
+        signature = hmac.new(sign_key, sign_bytes, hash_type).hexdigest()
+        headers['Authorization'] = \
+            f'BackendAI signMethod=HMAC-{hash_type.upper()}, ' \
+            + f'credential={keypair["access_key"]}:{signature}'
+        return headers
+    return create_header
+
+
+@pytest.fixture
+async def create_app_and_client(request, test_id, test_ns,
+                                event_loop, app,
+                                default_keypair, user_keypair):
     client = None
-    app = handler = server = None
+    runner = None
+    extra_proc = None
 
-    async def maker(extra_inits=None):
-        nonlocal client, app, handler, server
+    async def maker(modules=None, ev_router=False, spawn_agent=False):
+        nonlocal client, runner, extra_proc
+
+        if modules is None:
+            modules = []
+        scheduler_opts = {
+            'close_timeout': 10,
+        }
+        cors_opts = {
+            '*': aiohttp_cors.ResourceOptions(
+                allow_credentials=False,
+                expose_headers="*", allow_headers="*"),
+        }
+        aiojobs.aiohttp.setup(app, **scheduler_opts)
+        await gw_init(app, cors_opts)
+        for mod in modules:
+            target_module = import_module(f'.{mod}', 'ai.backend.gateway')
+            subapp, mw = getattr(target_module, 'create_app', None)(cors_opts)
+            assert isinstance(subapp, web.Application)
+            for key in PUBLIC_INTERFACES:
+                subapp[key] = app[key]
+            prefix = subapp.get('prefix', mod.replace('_', '-'))
+            aiojobs.aiohttp.setup(subapp, **scheduler_opts)
+            app.add_subapp('/' + prefix, subapp)
+            app.middlewares.extend(mw)
+
+            # TODO: refactor to avoid duplicates with gateway.server
+
+            # Add legacy version-prefixed routes to the root app with some hacks
+            for r in subapp.router.routes():
+                for version in subapp['api_versions']:
+                    subpath = r.resource.canonical
+                    if subpath == f'/{prefix}':
+                        subpath += '/'
+                    legacy_path = f'/v{version}{subpath}'
+                    handler = _get_legacy_handler(r.handler, subapp, version)
+                    app.router.add_route(r.method, legacy_path, handler)
+
         server_params = {}
         client_params = {}
-        app, port, handler, server = await _create_server(
-            loop, unused_port, extra_inits=extra_inits, **server_params)
-        if app.sslctx:
-            url = 'https://localhost:{}'.format(port)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(
+            runner,
+            app['config'].service_ip,
+            app['config'].service_port,
+            ssl_context=app.get('sslctx'),
+            **server_params,
+        )
+        await site.start()
+
+        if ev_router:
+            # Run event_router proc. Is it enough? No way to get return values
+            # (app, client, etc) by using aiotools.start_server.
+            args = (app['config'],)
+            extra_proc = mp.Process(target=event_router,
+                                    args=('', 0, args,),
+                                    daemon=True)
+            extra_proc.start()
+
+        # Launch an agent daemon
+        if spawn_agent:
+            etcd_addr = host_port_pair(os.environ['BACKEND_ETCD_ADDR'])
+            os.makedirs(f'/tmp/backend.ai/scratches-{test_id}', exist_ok=True)
+            agent_proc = subprocess.Popen([
+                'python', '-m', 'ai.backend.agent.server',
+                '--etcd-addr', str(etcd_addr),
+                '--namespace', test_ns,
+                '--scratch-root', f'/tmp/backend.ai/scratches-{test_id}',
+                '--idle-timeout', '30',
+            ])
+
+            def finalize_agent():
+                agent_proc.terminate()
+                try:
+                    agent_proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    agent_proc.kill()
+                shutil.rmtree(f'/tmp/backend.ai/scratches-{test_id}')
+
+            request.addfinalizer(finalize_agent)
+
+            async def wait_for_agent():
+                while True:
+                    all_ids = [inst_id async for inst_id in
+                               app['registry'].enumerate_instances()]
+                    if len(all_ids) > 0:
+                        break
+                    await asyncio.sleep(0.2)
+            task = event_loop.create_task(wait_for_agent())
+            with timeout(10.0):
+                await task
+
+        port = app['config'].service_port
+        if app.get('sslctx'):
+            url = f'https://localhost:{port}'
             client_params['connector'] = aiohttp.TCPConnector(verify_ssl=False)
         else:
-            url = 'http://localhost:{}'.format(port)
-        client = Client(aiohttp.ClientSession(loop=loop, **client_params), url)
+            url = f'http://localhost:{port}'
+        http_session = aiohttp.ClientSession(
+            loop=event_loop, **client_params)
+        client = Client(http_session, url)
         return app, client
 
     yield maker
 
-    loop.run_until_complete(_finish_server(app, handler, server))
+    dbpool = app.get('dbpool')
+    if dbpool is not None:
+        # Clean DB tables for subsequent tests.
+        async with dbpool.acquire() as conn, conn.begin():
+            await conn.execute((vfolders.delete()))
+            await conn.execute((kernels.delete()))
+            await conn.execute((agents.delete()))
+            access_key = default_keypair['access_key']
+            query = (sa.update(keypairs)
+                       .values({
+                           'concurrency_used': 0,
+                           'num_queries': 0,
+                       })
+                       .where(keypairs.c.access_key == access_key))
+            await conn.execute(query)
+            access_key = user_keypair['access_key']
+            query = (sa.update(keypairs)
+                       .values({
+                           'concurrency_used': 0,
+                           'num_queries': 0,
+                       })
+                       .where(keypairs.c.access_key == access_key))
+            await conn.execute(query)
+
+    # Terminate client and servers
     if client:
-        client.close()
+        await client.close()
+    if runner:
+        await runner.cleanup()
+    await gw_shutdown(app)
+
+    if extra_proc:
+        os.kill(extra_proc.pid, signal.SIGINT)
+        extra_proc.join()
+
+
+@pytest.fixture(scope='session')
+def prepare_docker_images():
+    _loop = asyncio.new_event_loop()
+
+    async def pull():
+        docker = aiodocker.Docker()
+        images_to_pull = [
+            'lablup/kernel-lua:5.3-alpine',
+        ]
+        for img in images_to_pull:
+            try:
+                await docker.images.inspect(img)
+            except aiodocker.exceptions.DockerError as e:
+                assert e.status == 404
+                print(f'Pulling image "{img}" for testing...')
+                await docker.pull(img)
+        await docker.close()
+
+    try:
+        _loop.run_until_complete(pull())
+    finally:
+        _loop.close()
+
+
+@pytest.fixture
+async def prepare_kernel(request, create_app_and_client,
+                         get_headers, default_keypair):
+    sess_id = f'test-kernel-session-{secrets.token_hex(8)}'
+    app, client = await create_app_and_client(
+        modules=['etcd', 'events', 'auth', 'vfolder',
+                 'admin', 'ratelimit', 'kernel', 'stream', 'manager'],
+        spawn_agent=True,
+        ev_router=True)
+
+    async def create_kernel(image='lua:5.3-alpine', tag=None):
+        url = '/v3/kernel/'
+        req_bytes = json.dumps({
+            'image': image,
+            'tag': tag,
+            'clientSessionToken': sess_id,
+        }).encode()
+        headers = get_headers('POST', url, req_bytes)
+        response = await client.post(url, data=req_bytes, headers=headers)
+        return await response.json()
+
+    yield app, client, create_kernel
+
+    access_key = default_keypair['access_key']
+    try:
+        await app['registry'].destroy_session(sess_id, access_key)
+    except Exception:
+        pass

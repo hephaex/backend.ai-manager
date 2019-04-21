@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 # Backend.Ai Server Integration Testing Guide
+=======
+# backend.ai Server Integration Testing Guide
+>>>>>>> c2bb79a19c0574845ab66cc5f3c3402c9833ea34
 
 ## Asynchrony of Gateway and Agents
 
@@ -32,7 +36,11 @@ Checkpoints:
 
 Checkpoints:
 
+<<<<<<< HEAD
 * First of all, **backend.ai-gateway** must be alive all the time, as much as possible.
+=======
+* First of all, **backend.aia-gateway** must be alive all the time, as much as possible.
+>>>>>>> c2bb79a19c0574845ab66cc5f3c3402c9833ea34
 * When **backend.ai-gateway** terminates, it should not touch both Redis and DB.
   * TODO: store `kernel_owners` in Redis (`kernel_id` to `access_key` mapping; maybe field as rdb 2?)
 * After restarted,

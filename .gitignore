@@ -22,7 +22,6 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
-*.whl
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -44,6 +43,7 @@ nosetests.xml
 coverage.xml
 *,cover
 .mypy-cache/
+.pytest_cache/
 
 # Translations
 *.mo
@@ -60,9 +60,17 @@ target/
 
 # IDE stuffs
 .idea/
+.vscode/
 .env
+.envrc
 .*.swp
+
+# virtualenvs
 venv*/
+.python-version
+
+# for local integration tests
+ai/backend/agent
 
 # User configuratinos
 alembic.ini

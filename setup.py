@@ -1,11 +1,6 @@
 from setuptools import setup
-import sys
-try:
-    import pypandoc
-    long_description = pypandoc.convert('README.md', 'rst')
-except (IOError, ImportError):
-    long_description = ""
 
+<<<<<<< HEAD
 
 requires = [
     'ConfigArgParse',
@@ -83,3 +78,6 @@ setup(
     },
     data_files=[],
 )
+=======
+setup()
+>>>>>>> c2bb79a19c0574845ab66cc5f3c3402c9833ea34
